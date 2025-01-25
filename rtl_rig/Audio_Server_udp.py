@@ -24,7 +24,7 @@ FRAME_SIZE = int(AUDIO_SAMPLE_RATE * FRAME_DURATION / 1000)
 #info = sd.query_devices(device_id, "input")
 #print(info)
 class AudioHandler:
-    def __init__(self, queue_maxsize=50):
+    def __init__(self, queue_maxsize=10):
         self.audio_queue = asyncio.Queue(maxsize=queue_maxsize)
         self.encoder = Encoder(AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, application)
         self.encoder.bitrate = bitrate
