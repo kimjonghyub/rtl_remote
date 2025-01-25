@@ -12,14 +12,8 @@ import subprocess
 import signal
 import threading
 import queue
-import os
-import sys
-
-os.environ["PYTHONUNBUFFERED"] = "1"
-os.environ["SDL_AUDIODRIVER"] = "alsa"
-os.environ["ALSA_DEBUG"] = "0"
-sys.stderr = open(os.devnull, 'w')
-
+from asyncio import Lock
+import time
 
 BLACK =    (  0,   0,   0)
 WHITE =    (255, 255, 255)
@@ -46,6 +40,8 @@ CMD_SET_GAIN_MODE = 0x03
 CMD_SET_OFFSET_TUNING = 0x0A
 CMD_RIG_SET_FREQ = 0x20
 CMD_RIG_GET_FREQ = 0x21
+CMD_RIG_SET_VFO = 0x22
+CMD_RIG_SET_MODE = 0x23
 FRAME_SIZE = 512
 BUFFER_SIZE = FRAME_SIZE * 20
 FREQ_RANGE = 256
@@ -65,12 +61,14 @@ GAIN_MODE = 0
 WIDTH, HEIGHT = 400, 800
 BUTTON_WIDTH, BUTTON_HEIGHT = 100, 35
 FPS = 20
-BUTTON_AREA_HEIGHT = 150
+BUTTON_AREA_HEIGHT = 200
 MARGIN = 50
 FFT_GRAPH_HEIGHT = (HEIGHT - BUTTON_AREA_HEIGHT) // 2
 WATERFALL_HEIGHT = HEIGHT - BUTTON_AREA_HEIGHT - FFT_GRAPH_HEIGHT
 MIN_DB = -50
 MAX_DB = 120
+MODE = "000"
+VFO = "A"
 
 class SmoothValue:
     def __init__(self, smoothing_factor=0.1):
@@ -128,7 +126,7 @@ button_text = "Connect"
 text_color = (BLACK)
 font = pygame.font.SysFont(None, 24)
 font_tick = pygame.font.SysFont(None, 20)
-rig_frequency = 00000000
+rig_frequency = 0000000
 
 freq_dot_font = pygame.font.SysFont(None, 70)
 freq_mhz_font = pygame.font.SysFont(None, 30)
@@ -167,13 +165,29 @@ def stop_audio_client_subprocess():
         audio_process.terminate()
 
 def ctlbox():
-    global smoothed_center_magnitude
-    ctl_box = pygame.Surface(((WIDTH), BUTTON_AREA_HEIGHT) )
+    global smoothed_center_magnitude, MODE, VFO, rig_frequency
+    ctl_box = pygame.Surface(((WIDTH), BUTTON_AREA_HEIGHT))
     ctl_box.fill(GRAY)
-    screen.blit(ctl_box, (0,0))
-    draw_frequency(rig_frequency, 10, 60)
-    meter_rect = pygame.Rect(10, 120, 300, 20)  
+    screen.blit(ctl_box, (0, 0))
+
+    # Display current mode
+    msg = f"Mode: {MODE}"
+    screen.blit(font.render(msg, True, WHITE, GRAY), (10, 130))
+
+    # Display current VFO
+    msg = f"VFO: {VFO}"
+    screen.blit(font.render(msg, True, WHITE, GRAY), (130, 130))
+
+    # Display frequency
+    draw_frequency(rig_frequency, 10, 55)
+
+    # Display signal strength meter
+    meter_rect = pygame.Rect(10, 160, 290, 25)
     draw_level_meter(screen, smoothed_center_magnitude, meter_rect)
+    
+    
+
+    
     
 def format_frequency_parts(freq_hz):
     rigfreq1 = str(freq_hz).zfill(8)  
@@ -209,21 +223,31 @@ def draw_level_meter(screen, center_magnitude, meter_rect):
     pygame.draw.rect(screen, GREEN, filled_rect)
     pygame.draw.rect(screen, WHITE, meter_rect, 2)
     msg = "%0.2f db" % (smoothed_center_magnitude) 
-    screen.blit(font.render(msg, 1, WHITE, GRAY),(meter_rect.x + meter_rect.width + 10, meter_rect.y))
+    screen.blit(font.render(msg, 1, WHITE, GRAY),(meter_rect.x + meter_rect.width - 70, meter_rect.y+5))
 
 def text_objects(text, text_font, color):
     textSurface = font.render(text, 1, color)
     return textSurface, textSurface.get_rect()
 
+last_click_time = 0
+click_cooldown = 0.2  # 200ms
+
 def button(msg,x,y,w,h,ic,ac,tc,hc,action=None):
+    global last_click_time
+    
     mouse = pygame.mouse.get_pos()
     click = pygame.mouse.get_pressed()
+    
     if x+w > mouse[0] > x and y+h > mouse[1] > y:
         pygame.draw.rect(screen, ac,(x,y,w,h))
         text_color = hc
         if click[0] == 1 and action != None:
-            text_color = tc
-            asyncio.create_task(action())
+            current_time = time.time()
+            if current_time - last_click_time > click_cooldown: 
+                last_click_time = current_time
+                text_color = tc
+                if action is not None:
+                    asyncio.create_task(action())
     else:
         pygame.draw.rect(screen, ic,(x,y,w,h))
         text_color = tc
@@ -482,34 +506,33 @@ async def handle_rig_connection():
         rig_reader, rig_writer = await asyncio.open_connection(SERVER_IP, RIG_PORT)
         rig_connected = True
         print("RIG server Connected.")
+        
         await asyncio.sleep(0.5) 
         asyncio.create_task(rig_reader_task())
         asyncio.create_task(rig_command_task())
-                   
+        asyncio.create_task(set_rig_vfo(0))
+        #mode_index = 2
+        #asyncio.create_task(set_rig_mode())           
     except Exception as e:
         print(f"Failed to connect to RIG server: {e}")
         rig_connected = False
-
+"""
 async def rig_reader_task():
-    """Reads data from the RIG server and routes it appropriately."""
+    
     global rig_reader, rig_connected, rig_frequency
     try:
         while rig_connected:
             try:
                 # Read 4 bytes from the server
                 data = await rig_reader.readexactly(4)
-
-                # Check if a command is pending
-                if not rig_command_queue.empty():
-                    # Route to the command response queue
-                    await rig_response_queue.put(data)
-                    #print("Command response received.")
-                else:
-                    # Treat as a notification
-                    freq = struct.unpack(">I", data)[0]
+                #print(f"Raw data received: {data}")
+                freq = struct.unpack(">I", data)[0]
+                if 100000 <= freq <= 30000000:  
                     rig_frequency = freq
                     print(f"Received frequency notification: {freq} Hz")
-
+                #else:
+                    #print(f"Invalid frequency received: {freq} Hz")
+ 
             except asyncio.IncompleteReadError as e:
                 
                 rig_connected = False
@@ -522,10 +545,56 @@ async def rig_reader_task():
         print("RIG reader task canceled.")
     #finally:
         #print("RIG reader task stopped.")
+"""
+modes = [1, 2, 3, 4, 5]
+mode_names = {
+    1: "USB",
+    2: "LSB",
+    3: "AM",
+    4: "FM",
+    5: "CW"
+}
+mode_index = 0
+mode_lock = Lock()
+
+vfo_names = {
+    11: "A",
+    12: "B",
+}
+
+async def rig_reader_task():
+    """Reads data from the RIG server and processes it."""
+    global rig_reader, rig_connected, rig_frequency, MODE
+    try:
+        while rig_connected:
+            try:
+                # Read 4 bytes from the server
+                data = await rig_reader.readexactly(4)
+
+                # Interpret the received data
+                value = struct.unpack(">I", data)[0]
+                if value in mode_names:  # Check if value corresponds to a mode
+                    MODE = mode_names[value]
+                    print(f"Received mode notification: {MODE}")
+                elif value in vfo_names:  # Check if value corresponds to a VFO
+                    VFO = vfo_names[value]
+                    print(f"Received VFO notification: {VFO}")
+                elif 100000 <= value <= 30000000:  # Check if value is a valid frequency
+                    rig_frequency = value
+                    print(f"Received frequency notification: {rig_frequency} Hz")
+                else:
+                    print(f"Received unknown value: {value}")
+            except asyncio.IncompleteReadError:
+                rig_connected = False
+                break
+            except Exception as e:
+                print(f"Error in rig_reader_task: {e}")
+    except asyncio.CancelledError:
+        print("RIG reader task canceled.")
         
 async def rig_command_task():
     """Processes commands and waits for responses."""
-    global rig_writer, rig_connected, rig_frequency
+    global rig_writer, rig_connected
     try:
         while rig_connected:
             response_event = None
@@ -533,20 +602,9 @@ async def rig_command_task():
                 # Wait for a command in the queue
                 if not rig_command_queue.empty():
                     command, response_event = await rig_command_queue.get()
-
                     # Send the command to the server
                     rig_writer.write(command)
                     await rig_writer.drain()
-                    #print(f"Sent command: {command.hex()}")
-
-                    # Wait for the response
-                   
-                    response = await asyncio.wait_for(rig_response_queue.get(), timeout=1.0)
-                    rig_frequency = struct.unpack(">I", response)[0]
-                    print(f"Command response: {rig_frequency} Hz")
-                    
-
-                    # Trigger the response event
                     if response_event:
                         response_event.set()
 
@@ -555,7 +613,7 @@ async def rig_command_task():
                 if response_event:
                     response_event.set()
 
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.1)
 
     except asyncio.CancelledError:
         print("RIG command task canceled.")
@@ -587,14 +645,14 @@ async def toggle_rig_connection():
     else:
         print("Connecting to RIG server...")
         await handle_rig_connection()
-     
-async def get_rig_frequency():
+
+async def set_rig_vfo(PARAM):
     """Send CMD_RIG_GET_FREQ and wait for response."""
-    global rig_command_queue
+    global rig_command_queue, VFO
 
     # Prepare command and enqueue it
-    cmd_id = CMD_RIG_GET_FREQ
-    param = 0
+    cmd_id = CMD_RIG_SET_VFO
+    param = PARAM
     command = struct.pack(">BI", cmd_id, param)
     response_event = asyncio.Event()
 
@@ -603,16 +661,50 @@ async def get_rig_frequency():
 
     # Wait for the response or timeout
     await asyncio.wait_for(response_event.wait(), timeout=1.0)
-    print(f"Frequency received: {rig_frequency} Hz")
+    #print(f"Frequency received: {rig_frequency} Hz")
+    vfo_name = "A" if param == 0 else "B"
+    VFO = vfo_name
+    #logging.info(f"VFO changed to: {vfo_name}")
+    
+
+
+async def set_rig_mode():
+    """Change the mode and send it to the server."""
+    global mode_index, MODE
+    async with mode_lock:
+        
+        mode = modes[mode_index]
+        mode_name = mode_names.get(mode, "Unknown")  
+        MODE = mode_name
+        try:
+            # Prepare command
+            cmd_id = CMD_RIG_SET_MODE
+            command = struct.pack(">BI", cmd_id, mode)
+            response_event = asyncio.Event()
+
+            # Enqueue the command
+            await rig_command_queue.put((command, response_event))
+            print(f"Sending mode change command: {mode} ({mode_name})")
+
+            # Wait for response or timeout
+            await asyncio.wait_for(response_event.wait(), timeout=1.0)
+            print(f"Mode changed to {mode_name} successfully.")
+        except Exception as e:
+            print(f"Error in change_mode: {e}")
+
+        # Update mode index for the next call
+        mode_index = (mode_index + 1) % len(modes)
     
        
 def draw_button():
     
     button("connect",10,10,100,35,RED,SCREEN,GRAY,WHITE)
-    button("256Khz",120,10,80,35,SCREEN,SCREEN,GRAY,WHITE,lambda: set_freq_range(256))
-    button("512Khz",210,10,80,35,SCREEN,SCREEN,GRAY,WHITE,lambda: set_freq_range(512))
-    button("1024Khz",300,10,80,35,SCREEN,SCREEN,GRAY,WHITE,lambda: set_freq_range(1024))
-    button("Rig Freq", 300, 55, 80, 35, BLUE_GRAY, SCREEN, WHITE, RED, get_rig_frequency)
+    button("256Khz",130,10,80,35,SCREEN,SCREEN,GRAY,WHITE,lambda: set_freq_range(256))
+    button("512Khz",220,10,80,35,SCREEN,SCREEN,GRAY,WHITE,lambda: set_freq_range(512))
+    button("1024Khz",310,10,80,35,SCREEN,SCREEN,GRAY,WHITE,lambda: set_freq_range(1024))
+    button("A", 310, 55, 35, 35, BLUE_GRAY, SCREEN, WHITE, RED, lambda:set_rig_vfo(0))
+    button("B", 355, 55, 35, 35, BLUE_GRAY, SCREEN, WHITE, RED, lambda:set_rig_vfo(1))
+    button("Mode", 310, 100, 80, 35, BLUE_GRAY, SCREEN, WHITE, RED, lambda:set_rig_mode())
   
 async def shutdown():
     """Cancel all pending tasks."""
